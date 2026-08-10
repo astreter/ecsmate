@@ -37,6 +37,7 @@ func (p *Planner) GeneratePlan(state *resources.DesiredState) *Plan {
 		applyPropagatedChanges(state, changes)
 	}
 
+	p.planLogGroups(state, plan)
 	p.planTaskDefs(state, plan)
 	p.planServiceDiscovery(state, plan)
 	p.planTargetGroups(state, plan)
@@ -134,6 +135,43 @@ func scheduledTaskActionFromString(action string) resources.ScheduledTaskAction 
 		return resources.ScheduledTaskActionDelete
 	default:
 		return resources.ScheduledTaskActionNoop
+	}
+}
+
+func (p *Planner) planLogGroups(state *resources.DesiredState, plan *Plan) {
+	for name, lg := range state.LogGroups {
+		if lg.Action == resources.LogGroupActionNoop && !lg.NeedsSubscriptionReconcile {
+			continue
+		}
+
+		entry := diff.DiffEntry{
+			Name:     name,
+			Resource: "LogGroup",
+		}
+
+		switch lg.Action {
+		case resources.LogGroupActionCreate:
+			entry.Type = diff.DiffTypeCreate
+			entry.Desired = buildLogGroupView(lg)
+			plan.Summary.Creates++
+		case resources.LogGroupActionUpdate:
+			entry.Type = diff.DiffTypeUpdate
+			entry.Current = buildLogGroupCurrentView(lg)
+			entry.Desired = buildLogGroupView(lg)
+			plan.Summary.Updates++
+		case resources.LogGroupActionDelete:
+			entry.Type = diff.DiffTypeDelete
+			entry.Current = buildLogGroupCurrentView(lg)
+			plan.Summary.Deletes++
+		case resources.LogGroupActionNoop:
+			entry.Type = diff.DiffTypeUpdate
+			entry.Current = buildLogGroupCurrentView(lg)
+			entry.Desired = buildLogGroupView(lg)
+			entry.Details = "subscription filters changed"
+			plan.Summary.Updates++
+		}
+
+		plan.Entries = append(plan.Entries, entry)
 	}
 }
 
@@ -417,10 +455,7 @@ func (plan *Plan) HasChanges() bool {
 // HasImageOnlyChanges returns true if all changes are image-only updates.
 // This means:
 // - All TaskDefinition changes are image-only (only container image fields differ)
-// - All Service/ScheduledTask changes are either:
-//   - Propagated from image-only TaskDefs, or
-//   - Their TaskDef is unchanged (NOOP) - these updates are unrelated to image changes
-//
+// - All Service/ScheduledTask changes are UPDATE entries propagated from image-only TaskDefs
 // - No other resource types (TargetGroup, ListenerRule, etc.) have changes
 func (plan *Plan) HasImageOnlyChanges() bool {
 	if !plan.HasChanges() {
@@ -428,13 +463,10 @@ func (plan *Plan) HasImageOnlyChanges() bool {
 	}
 
 	imageOnlyTaskDefs := make(map[string]bool)
-	noopTaskDefs := make(map[string]bool)
 
 	// First pass: categorize TaskDefs from state (not entries, as NOOP may be filtered)
 	for name, td := range plan.State.TaskDefs {
-		if td.Action == resources.TaskDefActionNoop {
-			noopTaskDefs[name] = true
-		} else if td.IsImageOnlyChange() {
+		if td.IsImageOnlyChange() {
 			imageOnlyTaskDefs[name] = true
 		}
 	}
@@ -458,27 +490,19 @@ func (plan *Plan) HasImageOnlyChanges() bool {
 
 		case "Service":
 			svc, ok := plan.State.Services[entry.Name]
-			if !ok || svc.Desired == nil {
+			if !ok || svc.Desired == nil || entry.PropagationReason != taskDefinitionUpdatePropagationReason {
 				return false
 			}
-			tdName := svc.Desired.TaskDefinition
-			// Allow if:
-			// - TaskDef is image-only (service updates because of image-only TaskDef change), or
-			// - TaskDef is NOOP (service update is unrelated to TaskDef/image changes)
-			if !imageOnlyTaskDefs[tdName] && !noopTaskDefs[tdName] {
+			if !imageOnlyTaskDefs[svc.Desired.TaskDefinition] {
 				return false
 			}
 
 		case "ScheduledTask":
 			task, ok := plan.State.ScheduledTasks[entry.Name]
-			if !ok || task.Desired == nil {
+			if !ok || task.Desired == nil || entry.PropagationReason != taskDefinitionUpdatePropagationReason {
 				return false
 			}
-			tdName := task.Desired.TaskDefinition
-			// Allow if:
-			// - TaskDef is image-only (task updates because of image-only TaskDef change), or
-			// - TaskDef is NOOP (task update is unrelated to TaskDef/image changes)
-			if !imageOnlyTaskDefs[tdName] && !noopTaskDefs[tdName] {
+			if !imageOnlyTaskDefs[task.Desired.TaskDefinition] {
 				return false
 			}
 
@@ -488,6 +512,63 @@ func (plan *Plan) HasImageOnlyChanges() bool {
 	}
 
 	return len(imageOnlyTaskDefs) > 0
+}
+
+type LogGroupView struct {
+	Name                string                   `json:"name"`
+	RetentionInDays     int                      `json:"retentionInDays,omitempty"`
+	KMSKeyID            string                   `json:"kmsKeyId,omitempty"`
+	SubscriptionFilters []SubscriptionFilterView `json:"subscriptionFilters,omitempty"`
+}
+
+type SubscriptionFilterView struct {
+	Name           string `json:"name"`
+	DestinationArn string `json:"destinationArn"`
+	FilterPattern  string `json:"filterPattern,omitempty"`
+	RoleArn        string `json:"roleArn,omitempty"`
+	Distribution   string `json:"distribution,omitempty"`
+}
+
+func buildLogGroupView(lg *resources.LogGroupResource) LogGroupView {
+	view := LogGroupView{}
+	if lg == nil || lg.Desired == nil {
+		return view
+	}
+	view.Name = lg.Desired.Name
+	view.RetentionInDays = lg.Desired.RetentionInDays
+	view.KMSKeyID = lg.Desired.KMSKeyID
+	for _, filter := range lg.Desired.SubscriptionFilters {
+		view.SubscriptionFilters = append(view.SubscriptionFilters, SubscriptionFilterView{
+			Name:           filter.Name,
+			DestinationArn: filter.DestinationArn,
+			FilterPattern:  filter.FilterPattern,
+			RoleArn:        filter.RoleArn,
+			Distribution:   filter.Distribution,
+		})
+	}
+	return view
+}
+
+func buildLogGroupCurrentView(lg *resources.LogGroupResource) LogGroupView {
+	view := LogGroupView{}
+	if lg == nil {
+		return view
+	}
+	if lg.Current != nil {
+		view.Name = aws.ToString(lg.Current.LogGroupName)
+		view.RetentionInDays = int(aws.ToInt32(lg.Current.RetentionInDays))
+		view.KMSKeyID = aws.ToString(lg.Current.KmsKeyId)
+	}
+	for _, filter := range lg.CurrentSubscriptionFilters {
+		view.SubscriptionFilters = append(view.SubscriptionFilters, SubscriptionFilterView{
+			Name:           aws.ToString(filter.FilterName),
+			DestinationArn: aws.ToString(filter.DestinationArn),
+			FilterPattern:  aws.ToString(filter.FilterPattern),
+			RoleArn:        aws.ToString(filter.RoleArn),
+			Distribution:   string(filter.Distribution),
+		})
+	}
+	return view
 }
 
 type TaskDefView struct {

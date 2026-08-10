@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	cloudwatchtypes "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
 	"github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	elbv2types "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
 
@@ -148,6 +149,74 @@ func TestPlanner_GeneratePlan_EntryTypes(t *testing.T) {
 
 	if typeCount[diff.DiffTypeNoop] != 1 {
 		t.Errorf("expected 1 NOOP, got %d", typeCount[diff.DiffTypeNoop])
+	}
+}
+
+func TestPlanner_GeneratePlan_LogGroupSubscriptionChange(t *testing.T) {
+	const kmsKeyID = "arn:aws:kms:eu-west-1:123456789012:key/logs"
+
+	state := &resources.DesiredState{
+		LogGroups: map[string]*resources.LogGroupResource{
+			"/ecs/app": {
+				Name: "/ecs/app",
+				Desired: &resources.LogGroupSpec{
+					Name:            "/ecs/app",
+					RetentionInDays: 14,
+					KMSKeyID:        kmsKeyID,
+					SubscriptionFilters: []resources.SubscriptionFilterSpec{{
+						Name:           "errors",
+						DestinationArn: "arn:aws:lambda:eu-west-1:123456789012:function:new",
+						FilterPattern:  "?ERROR",
+					}},
+				},
+				Current: &cloudwatchtypes.LogGroup{
+					LogGroupName:    aws.String("/ecs/app"),
+					RetentionInDays: aws.Int32(14),
+					KmsKeyId:        aws.String(kmsKeyID),
+				},
+				CurrentSubscriptionFilters: []cloudwatchtypes.SubscriptionFilter{{
+					FilterName:     aws.String("errors"),
+					DestinationArn: aws.String("arn:aws:lambda:eu-west-1:123456789012:function:old"),
+					FilterPattern:  aws.String("?ERROR"),
+				}},
+				NeedsSubscriptionReconcile: true,
+				Action:                     resources.LogGroupActionNoop,
+			},
+		},
+	}
+
+	plan := NewPlanner().GeneratePlan(state)
+	if len(plan.Entries) != 1 {
+		t.Fatalf("entries: got %d, want 1", len(plan.Entries))
+	}
+
+	entry := plan.Entries[0]
+	if entry.Type != diff.DiffTypeUpdate {
+		t.Errorf("entry type: got %s, want %s", entry.Type, diff.DiffTypeUpdate)
+	}
+	if entry.Details != "subscription filters changed" {
+		t.Errorf("entry details: got %q", entry.Details)
+	}
+
+	current, ok := entry.Current.(LogGroupView)
+	if !ok {
+		t.Fatalf("current view type: got %T", entry.Current)
+	}
+	desired, ok := entry.Desired.(LogGroupView)
+	if !ok {
+		t.Fatalf("desired view type: got %T", entry.Desired)
+	}
+	if current.KMSKeyID != kmsKeyID || desired.KMSKeyID != kmsKeyID {
+		t.Errorf("KMS key IDs: current=%q desired=%q", current.KMSKeyID, desired.KMSKeyID)
+	}
+	if len(current.SubscriptionFilters) != 1 || len(desired.SubscriptionFilters) != 1 {
+		t.Fatalf("subscription filters: current=%d desired=%d", len(current.SubscriptionFilters), len(desired.SubscriptionFilters))
+	}
+	if current.SubscriptionFilters[0].DestinationArn == desired.SubscriptionFilters[0].DestinationArn {
+		t.Errorf("subscription destination change is not visible: %q", current.SubscriptionFilters[0].DestinationArn)
+	}
+	if plan.Summary.Updates != 1 {
+		t.Errorf("updates: got %d, want 1", plan.Summary.Updates)
 	}
 }
 
@@ -843,6 +912,87 @@ func TestPlan_HasImageOnlyChanges_CreateTaskDef(t *testing.T) {
 
 	if plan.HasImageOnlyChanges() {
 		t.Error("CREATE TaskDefinition should not be considered image-only")
+	}
+}
+
+func TestPlan_HasImageOnlyChanges_DirectServiceUpdateIsNotImageOnly(t *testing.T) {
+	plan := &Plan{
+		State: &resources.DesiredState{
+			TaskDefs: map[string]*resources.TaskDefResource{
+				"web": {
+					Action:  resources.TaskDefActionUpdate,
+					Current: &types.TaskDefinition{ContainerDefinitions: []types.ContainerDefinition{{Name: aws.String("web"), Image: aws.String("web:v1"), Essential: aws.Bool(true)}}},
+					Desired: &config.TaskDefinition{ContainerDefinitions: []config.ContainerDefinition{{Name: "web", Image: "web:v2", Essential: true}}},
+				},
+			},
+			Services: map[string]*resources.ServiceResource{
+				"api": {
+					Action:  resources.ServiceActionUpdate,
+					Desired: &config.Service{TaskDefinition: "web"},
+				},
+			},
+		},
+		Entries: []diff.DiffEntry{
+			{Resource: "TaskDefinition", Name: "web", Type: diff.DiffTypeUpdate},
+			{Resource: "Service", Name: "api", Type: diff.DiffTypeUpdate},
+		},
+		Summary: diff.DiffSummary{Updates: 2},
+	}
+
+	if plan.HasImageOnlyChanges() {
+		t.Error("direct Service UPDATE should not be considered image-only")
+	}
+}
+
+func TestPlan_HasImageOnlyChanges_PropagatedServiceUpdateIsImageOnly(t *testing.T) {
+	state := &resources.DesiredState{
+		TaskDefs: map[string]*resources.TaskDefResource{
+			"web": {
+				Action:  resources.TaskDefActionUpdate,
+				Current: &types.TaskDefinition{ContainerDefinitions: []types.ContainerDefinition{{Name: aws.String("web"), Image: aws.String("web:v1"), Essential: aws.Bool(true)}}},
+				Desired: &config.TaskDefinition{ContainerDefinitions: []config.ContainerDefinition{{Name: "web", Image: "web:v2", Essential: true}}},
+			},
+		},
+		Services: map[string]*resources.ServiceResource{
+			"api": {
+				Action:  resources.ServiceActionNoop,
+				Desired: &config.Service{TaskDefinition: "web"},
+			},
+		},
+	}
+
+	plan := NewPlanner().GeneratePlan(state)
+	if !plan.HasImageOnlyChanges() {
+		t.Error("propagated Service UPDATE from image-only TaskDefinition should be considered image-only")
+	}
+}
+
+func TestPlan_HasImageOnlyChanges_NonTaskDefPropagationIsNotImageOnly(t *testing.T) {
+	plan := &Plan{
+		State: &resources.DesiredState{
+			TaskDefs: map[string]*resources.TaskDefResource{
+				"web": {
+					Action:  resources.TaskDefActionUpdate,
+					Current: &types.TaskDefinition{ContainerDefinitions: []types.ContainerDefinition{{Name: aws.String("web"), Image: aws.String("web:v1"), Essential: aws.Bool(true)}}},
+					Desired: &config.TaskDefinition{ContainerDefinitions: []config.ContainerDefinition{{Name: "web", Image: "web:v2", Essential: true}}},
+				},
+			},
+			Services: map[string]*resources.ServiceResource{
+				"api": {
+					Action:  resources.ServiceActionUpdate,
+					Desired: &config.Service{TaskDefinition: "web"},
+				},
+			},
+		},
+		Entries: []diff.DiffEntry{
+			{Resource: "TaskDefinition", Name: "web", Type: diff.DiffTypeUpdate},
+			{Resource: "Service", Name: "api", Type: diff.DiffTypeUpdate, PropagationReason: "TargetGroup recreated"},
+		},
+		Summary: diff.DiffSummary{Updates: 2},
+	}
+
+	if plan.HasImageOnlyChanges() {
+		t.Error("service update propagated from a non-task-definition change should not be considered image-only")
 	}
 }
 

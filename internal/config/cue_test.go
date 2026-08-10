@@ -61,36 +61,34 @@ manifest: schema.#Manifest & {
 	}
 
 	for _, tt := range tests {
-		t.Run(
-			tt.name, func(t *testing.T) {
-				// Create temp directory within project to access schema
-				tmpDir := t.TempDir()
+		t.Run(tt.name, func(t *testing.T) {
+			// Create temp directory within project to access schema
+			tmpDir := t.TempDir()
 
-				// Write test CUE file
-				testFile := filepath.Join(tmpDir, "test.cue")
-				if err := os.WriteFile(testFile, []byte(tt.cueFile), 0644); err != nil {
-					t.Fatal(err)
+			// Write test CUE file
+			testFile := filepath.Join(tmpDir, "test.cue")
+			if err := os.WriteFile(testFile, []byte(tt.cueFile), 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			setupTestCueModule(t, tmpDir, projectRoot)
+
+			// Test validation
+			loader := NewCUELoader()
+			_, err := loader.LoadManifest(tmpDir, nil, nil)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("expected error containing %q, got nil", tt.errMsg)
+				} else if !strings.Contains(err.Error(), tt.errMsg) {
+					t.Errorf("expected error containing %q, got %v", tt.errMsg, err)
 				}
-
-				setupTestCueModule(t, tmpDir, projectRoot)
-
-				// Test validation
-				loader := NewCUELoader()
-				_, err := loader.LoadManifest(tmpDir, nil, nil)
-
-				if tt.wantErr {
-					if err == nil {
-						t.Errorf("expected error containing %q, got nil", tt.errMsg)
-					} else if !strings.Contains(err.Error(), tt.errMsg) {
-						t.Errorf("expected error containing %q, got %v", tt.errMsg, err)
-					}
-				} else {
-					if err != nil {
-						t.Errorf("unexpected error: %v", err)
-					}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
 				}
-			},
-		)
+			}
+		})
 	}
 }
 
@@ -151,17 +149,15 @@ func TestRelativePathInDir(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		t.Run(
-			tt.name, func(t *testing.T) {
-				gotPath, gotInside := relativePathInDir(baseDir, tt.targetPath)
-				if gotInside != tt.wantInside {
-					t.Fatalf("inside: got %v, want %v", gotInside, tt.wantInside)
-				}
-				if gotPath != tt.wantPath {
-					t.Fatalf("path: got %q, want %q", gotPath, tt.wantPath)
-				}
-			},
-		)
+		t.Run(tt.name, func(t *testing.T) {
+			gotPath, gotInside := relativePathInDir(baseDir, tt.targetPath)
+			if gotInside != tt.wantInside {
+				t.Fatalf("inside: got %v, want %v", gotInside, tt.wantInside)
+			}
+			if gotPath != tt.wantPath {
+				t.Fatalf("path: got %q, want %q", gotPath, tt.wantPath)
+			}
+		})
 	}
 }
 
@@ -175,46 +171,40 @@ func TestResolveValueFilePath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Run(
-		"absolute path", func(t *testing.T) {
-			got, err := resolveValueFilePath(baseDir, valuePath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got != valuePath {
-				t.Fatalf("got %q, want %q", got, valuePath)
-			}
-		},
-	)
+	t.Run("absolute path", func(t *testing.T) {
+		got, err := resolveValueFilePath(baseDir, valuePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != valuePath {
+			t.Fatalf("got %q, want %q", got, valuePath)
+		}
+	})
 
-	t.Run(
-		"manifest relative fallback", func(t *testing.T) {
-			got, err := resolveValueFilePath(baseDir, filepath.Join("values", "prod.cue"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got != valuePath {
-				t.Fatalf("got %q, want %q", got, valuePath)
-			}
-		},
-	)
+	t.Run("manifest relative fallback", func(t *testing.T) {
+		got, err := resolveValueFilePath(baseDir, filepath.Join("values", "prod.cue"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != valuePath {
+			t.Fatalf("got %q, want %q", got, valuePath)
+		}
+	})
 
-	t.Run(
-		"missing path stays current directory relative", func(t *testing.T) {
-			relPath := filepath.Join("values", "missing.cue")
-			got, err := resolveValueFilePath(baseDir, relPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			want, err := filepath.Abs(relPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got != want {
-				t.Fatalf("got %q, want %q", got, want)
-			}
-		},
-	)
+	t.Run("missing path stays current directory relative", func(t *testing.T) {
+		relPath := filepath.Join("values", "missing.cue")
+		got, err := resolveValueFilePath(baseDir, relPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, err := filepath.Abs(relPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("got %q, want %q", got, want)
+		}
+	})
 }
 
 func setupTestCueModule(t *testing.T, tmpDir, projectRoot string) {
@@ -276,14 +266,12 @@ func TestApplySetValues_OverridesDefaultValues(t *testing.T) {
 	loader := NewCUELoader()
 
 	// Use CUE default syntax (string | *"value") which allows override
-	base := loader.ctx.CompileString(
-		`
+	base := loader.ctx.CompileString(`
 		images: {
 			tag: string | *"original"
 			registry: string | *"ecr.aws"
 		}
-	`,
-	)
+	`)
 	if base.Err() != nil {
 		t.Fatalf("failed to compile base: %v", base.Err())
 	}
@@ -302,31 +290,33 @@ func TestApplySetValues_OverridesDefaultValues(t *testing.T) {
 	}
 }
 
-func TestApplySetValues_AllDigitTagStaysString(t *testing.T) {
+func TestApplySetValues_PreservesValuesForStringFields(t *testing.T) {
 	loader := NewCUELoader()
 
-	base := loader.ctx.CompileString(
-		`
+	base := loader.ctx.CompileString(`
 		images: {
 			tag: string | *"original"
 		}
-	`,
-	)
+	`)
 	if base.Err() != nil {
 		t.Fatalf("failed to compile base: %v", base.Err())
 	}
 
-	result, err := loader.applySetValues(base, []string{"images.tag=90681564"})
-	if err != nil {
-		t.Fatalf("applySetValues failed: %v", err)
-	}
+	for _, want := range []string{"90681564", "1.25", "true"} {
+		t.Run(want, func(t *testing.T) {
+			result, err := loader.applySetValues(base, []string{"images.tag=" + want})
+			if err != nil {
+				t.Fatalf("applySetValues failed: %v", err)
+			}
 
-	tag, err := ExtractString(result, "images.tag")
-	if err != nil {
-		t.Fatalf("failed to extract tag: %v", err)
-	}
-	if tag != "90681564" {
-		t.Errorf("expected tag '90681564', got '%s'", tag)
+			got, err := ExtractString(result, "images.tag")
+			if err != nil {
+				t.Fatalf("failed to extract tag: %v", err)
+			}
+			if got != want {
+				t.Errorf("tag: got %q, want %q", got, want)
+			}
+		})
 	}
 }
 
@@ -334,13 +324,11 @@ func TestApplySetValues_HiddenFields(t *testing.T) {
 	loader := NewCUELoader()
 
 	// Use CUE default syntax for hidden fields
-	base := loader.ctx.CompileString(
-		`
+	base := loader.ctx.CompileString(`
 		_values: {
 			namespace: string | *"original"
 		}
-	`,
-	)
+	`)
 	if base.Err() != nil {
 		t.Fatalf("failed to compile base: %v", base.Err())
 	}
@@ -367,8 +355,7 @@ func TestApplySetValues_HiddenFields(t *testing.T) {
 func TestApplySetValues_PackageHiddenFields(t *testing.T) {
 	loader := NewCUELoader()
 
-	base := loader.ctx.CompileString(
-		`
+	base := loader.ctx.CompileString(`
 		package test
 
 		_values: {
@@ -376,8 +363,7 @@ func TestApplySetValues_PackageHiddenFields(t *testing.T) {
 				tag: string | *"latest"
 			}
 		}
-	`,
-	)
+	`)
 	if base.Err() != nil {
 		t.Fatalf("failed to compile base: %v", base.Err())
 	}
@@ -408,14 +394,12 @@ func TestApplySetValues_NumericValues(t *testing.T) {
 	loader := NewCUELoader()
 
 	// Use CUE default syntax for numeric and boolean values
-	base := loader.ctx.CompileString(
-		`
+	base := loader.ctx.CompileString(`
 		config: {
 			count: int | *1
 			enabled: bool | *true
 		}
-	`,
-	)
+	`)
 	if base.Err() != nil {
 		t.Fatalf("failed to compile base: %v", base.Err())
 	}
@@ -489,14 +473,12 @@ func TestBuildCUEOverrideExpr(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		t.Run(
-			tt.path+"="+tt.value, func(t *testing.T) {
-				result := buildCUEOverrideExpr(tt.path, tt.value)
-				if result != tt.expected {
-					t.Errorf("expected %q, got %q", tt.expected, result)
-				}
-			},
-		)
+		t.Run(tt.path+"="+tt.value, func(t *testing.T) {
+			result := buildCUEOverrideExpr(tt.path, tt.value)
+			if result != tt.expected {
+				t.Errorf("expected %q, got %q", tt.expected, result)
+			}
+		})
 	}
 }
 
